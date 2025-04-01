@@ -261,9 +261,55 @@ Options for migrating data:
 │   ├── deploy.sh             # Deployment functions
 │   ├── data_migrate.sh       # Data migration functions
 │   ├── cloud_init.sh         # Cloud-init provisioning functions
-│   └── utils/                # Additional utility scripts
+│   ├── utils/                # Additional utility scripts
+│   │   └── template.sh       # Template processing functions
+│   └── templates/            # Configuration templates
+│       ├── docker-compose/   # Docker Compose configuration templates
+│       ├── nginx/            # Nginx configuration templates
+│       ├── apache/           # Apache configuration templates
+│       ├── systemd/          # Systemd service templates
+│       └── .env.template     # Environment variables template
 └── README.md                 # This documentation
 ```
+
+## Template System
+
+The script uses a template system to generate configuration files based on user input. This makes the deployment process more consistent and less error-prone.
+
+### Available Templates
+
+- **Docker Compose Templates** (`lib/templates/docker-compose/`):
+  - `default.yml` - A standard multi-container setup with backend, frontend, database, and Nginx
+  - `simple.yml` - A simple single-container setup
+
+- **Nginx Templates** (`lib/templates/nginx/`):
+  - `docker.conf` - Nginx configuration for Docker deployments
+  - `app.conf` - Nginx configuration for traditional applications
+  - `ssl.conf` - Nginx configuration with SSL support
+
+- **Systemd Templates** (`lib/templates/systemd/`):
+  - `app.service` - Systemd service template for running applications
+
+- **Environment Variables Template** (`lib/templates/.env.template`):
+  - A template for generating .env files with database credentials, API keys, etc.
+
+### How Templates Work
+
+The template system uses environment variables to substitute placeholders in the templates with actual values. For example, a template might contain:
+
+```
+DB_USER=${DB_USER:-appuser}
+```
+
+This will be replaced with the value of the `DB_USER` environment variable, or `appuser` if it's not set.
+
+### Customizing Templates
+
+You can customize the templates to match your specific requirements:
+
+1. Edit the templates in the `lib/templates/` directory
+2. Add new templates as needed
+3. Update the script to use your custom templates
 
 ## Customization
 

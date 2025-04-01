@@ -45,6 +45,7 @@ source "$DIR/lib/domain.sh"
 source "$DIR/lib/deploy.sh"
 source "$DIR/lib/data_migrate.sh"
 source "$DIR/lib/cloud_init.sh"
+source "$DIR/lib/utils/template.sh"
 
 # Export logging functions so they can be used in the sourced scripts
 export -f log_debug log_verbose log_info log_error

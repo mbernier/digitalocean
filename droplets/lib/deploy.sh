@@ -213,14 +213,61 @@ deploy_docker_compose_ghcr() {
     
     echo -e "Enter the image tag to deploy (e.g., latest):"
     read -p "> " TAG
+    TAG=${TAG:-latest}
     
     # Ask for GitHub token
     echo -e "Enter your GitHub Personal Access Token (will not be displayed):"
     read -s -p "> " GITHUB_TOKEN
     echo
     
+    # Ask for database configuration
+    echo -e "Enter database user (default: appuser):"
+    read -p "> " DB_USER
+    DB_USER=${DB_USER:-appuser}
+    
+    echo -e "Enter database password (will not be displayed, default: auto-generated):"
+    read -s -p "> " DB_PASSWORD
+    echo
+    if [ -z "$DB_PASSWORD" ]; then
+        DB_PASSWORD=$(openssl rand -base64 20 | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+        echo -e "${YELLOW}Generated password: $DB_PASSWORD${NC}"
+        echo -e "${YELLOW}Please save this password as it won't be shown again.${NC}"
+    fi
+    
+    echo -e "Enter database name (default: appdb):"
+    read -p "> " DB_NAME
+    DB_NAME=${DB_NAME:-appdb}
+    
+    # Create app directory if it doesn't exist
+    ssh root@$DROPLET_IP "mkdir -p /root/app/nginx/conf /root/app/nginx/certbot/conf /root/app/nginx/certbot/www /root/app/cache /root/app/images"
+    
+    # Process docker-compose template
+    local template_path=$(get_template_path "docker-compose" "default.yml")
+    local temp_compose_file=$(mktemp)
+    
+    # Export variables for template processing
+    export GITHUB_REPOSITORY="$GITHUB_REPOSITORY"
+    export TAG="$TAG"
+    export DB_USER="$DB_USER"
+    export DB_PASSWORD="$DB_PASSWORD"
+    export DB_NAME="$DB_NAME"
+    export API_KEY=${API_KEY:-default_key}
+    export ADMIN_API_KEY=${ADMIN_API_KEY:-default_admin_key}
+    export API_PORT=${API_PORT:-8000}
+    export APP_PORT=${APP_PORT:-3000}
+    
+    # Process the template
+    process_template_env "$template_path" "$temp_compose_file"
+    
     # Create setup script on the droplet
     echo -e "Setting up GitHub Container Registry authentication..."
+    
+    # Process .env template
+    local env_template=$(get_template_path "" ".env.template")
+    local temp_env_file=$(mktemp)
+    
+    # Process the template
+    process_template_env "$env_template" "$temp_env_file"
     
     cat << EOF > /tmp/setup_ghcr.sh
 #!/bin/bash
@@ -233,86 +280,24 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
 docker pull ghcr.io/$GITHUB_REPOSITORY/backend:$TAG
 docker pull ghcr.io/$GITHUB_REPOSITORY/frontend:$TAG
 
-# Create docker-compose.yml
-cat << EOC > /root/app/docker-compose.yml
-version: '3.8'
-
-services:
-  db:
-    image: postgres:15
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_USER=${DB_USER:-appuser}
-      - POSTGRES_PASSWORD=${DB_PASSWORD:-changeme}
-      - POSTGRES_DB=${DB_NAME:-appdb}
-    restart: always
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${DB_USER:-appuser}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  backend:
-    image: ghcr.io/$GITHUB_REPOSITORY/backend:$TAG
-    volumes:
-      - ./cache:/app/cache 
-      - ./images:/app/images
-    ports:
-      - "8000:8000"
-    environment:
-      - DB_HOST=db
-      - DB_USER=${DB_USER:-appuser}
-      - DB_PASSWORD=${DB_PASSWORD:-changeme}
-      - DB_NAME=${DB_NAME:-appdb}
-      - API_KEY=${API_KEY:-default_key}
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-default_admin_key}
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: always
-
-  frontend:
-    image: ghcr.io/$GITHUB_REPOSITORY/frontend:$TAG
-    ports:
-      - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://backend:8000
-    depends_on:
-      - backend
-    restart: always
-
-  nginx:
-    image: nginx:latest
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/conf:/etc/nginx/conf.d
-      - ./nginx/certbot/conf:/etc/letsencrypt
-      - ./nginx/certbot/www:/var/www/certbot
-    depends_on:
-      - backend
-      - frontend
-    restart: always
-
-volumes:
-  postgres_data:
-EOC
-
+# Start containers
+cd /root/app
+docker-compose up -d
 EOF
     
-    # Copy and execute the script on the droplet
-    scp /tmp/setup_ghcr.sh root@$DROPLET_IP:/tmp/setup_ghcr.sh
-    ssh root@$DROPLET_IP "chmod +x /tmp/setup_ghcr.sh && /tmp/setup_ghcr.sh"
+    # Upload the docker-compose.yml and setup script to the droplet
+    scp "$temp_compose_file" root@$DROPLET_IP:/root/app/docker-compose.yml
+    scp "$temp_env_file" root@$DROPLET_IP:/root/app/.env
+    scp /tmp/setup_ghcr.sh root@$DROPLET_IP:/root/app/setup_ghcr.sh
     
-    # Deploy using docker-compose
-    echo -e "Deploying containers..."
-    docker-compose -f /root/app/docker-compose.yml -H ssh://root@$DROPLET_IP up -d
+    # Make the setup script executable and run it
+    ssh root@$DROPLET_IP "chmod +x /root/app/setup_ghcr.sh && cd /root/app && ./setup_ghcr.sh"
     
-    # Clean up
-    ssh root@$DROPLET_IP "rm /tmp/setup_ghcr.sh"
-    rm /tmp/setup_ghcr.sh
+    # Clean up local temporary files
+    rm "$temp_compose_file" "$temp_env_file" /tmp/setup_ghcr.sh
+    
+    # Reset exported variables
+    unset GITHUB_REPOSITORY TAG DB_USER DB_PASSWORD DB_NAME API_KEY ADMIN_API_KEY API_PORT APP_PORT
 }
 
 # Deploy using single Docker container
@@ -385,11 +370,18 @@ deploy_docker() {
     sleep 2
 }
 
-# Deploy traditional application (non-Docker)
+# Deploy traditional application
 deploy_traditional() {
-    echo -e "${GREEN}Deploying traditional application...${NC}"
+    show_header "Traditional Application Deployment"
     
-    # Ask about application type
+    # Check if we have a droplet IP
+    if [ -z "$DROPLET_IP" ]; then
+        echo -e "${RED}Error: No droplet IP found. Please create a droplet first.${NC}"
+        sleep 2
+        return 1
+    fi
+    
+    # Select application type
     APP_TYPES=(
         "Node.js"
         "Python"
@@ -400,102 +392,105 @@ deploy_traditional() {
     
     select_from_menu "Select your application type" "${APP_TYPES[@]}"
     APP_TYPE_INDEX=$?
+    APP_TYPE=${APP_TYPES[$APP_TYPE_INDEX]}
     
-    # Set up the application
+    # Ask for application details
+    echo -e "Enter the path to your application (relative to current directory):"
+    read -p "> " APP_PATH
+    
+    if [ ! -d "$APP_PATH" ]; then
+        echo -e "${RED}Directory not found: $APP_PATH${NC}"
+        sleep 2
+        return 1
+    fi
+    
+    # Create app directory on the server
+    ssh root@$DROPLET_IP "mkdir -p /var/www/app"
+    
+    # Copy application files
+    echo -e "Copying application files..."
+    scp -r "$APP_PATH"/* root@$DROPLET_IP:/var/www/app/
+    
+    # Install dependencies based on application type
     case $APP_TYPE_INDEX in
         0) # Node.js
-            ssh root@$DROPLET_IP "curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && apt-get install -y nodejs"
-            ;;
-        1) # Python
-            ssh root@$DROPLET_IP "apt-get install -y python3 python3-pip python3-venv"
-            ;;
-        2) # Ruby
-            ssh root@$DROPLET_IP "apt-get install -y ruby-full"
-            ;;
-        3) # PHP
-            ssh root@$DROPLET_IP "apt-get install -y php php-fpm php-mysql"
-            ;;
-        4) # Other
-            echo -e "No specific runtime installed."
-            ;;
-    esac
-    
-    # Ask about application source
-    echo -e "How do you want to deploy your application?"
-    SOURCE_TYPES=(
-        "Git repository"
-        "Upload local files"
-        "Manual setup"
-    )
-    
-    select_from_menu "Select deployment source" "${SOURCE_TYPES[@]}"
-    SOURCE_TYPE_INDEX=$?
-    
-    # Deploy based on source type
-    case $SOURCE_TYPE_INDEX in
-        0) # Git repository
-            echo -e "Enter the Git repository URL:"
-            read -p "> " GIT_URL
+            echo -e "Installing Node.js dependencies..."
+            ssh root@$DROPLET_IP "apt-get update && apt-get install -y nodejs npm && cd /var/www/app && npm install --production"
             
-            echo -e "Enter the branch to deploy (default: main):"
-            read -p "> " GIT_BRANCH
-            GIT_BRANCH=${GIT_BRANCH:-main}
+            # Create .env file
+            echo -e "Creating .env file..."
+            local env_template=$(get_template_path "" ".env.template")
+            local temp_env_file=$(mktemp)
             
-            ssh root@$DROPLET_IP "mkdir -p /var/www/app && cd /var/www/app && git clone -b $GIT_BRANCH $GIT_URL ."
-            ;;
-        1) # Upload local files
-            echo -e "Enter the local directory to upload:"
-            read -p "> " LOCAL_DIR
+            # Set variables
+            echo -e "Enter your database user (default: appuser):"
+            read -p "> " DB_USER
+            DB_USER=${DB_USER:-appuser}
             
-            if [ ! -d "$LOCAL_DIR" ]; then
-                echo -e "${RED}Directory not found: $LOCAL_DIR${NC}"
-                sleep 2
-                return 1
+            echo -e "Enter your database password (default: auto-generated):"
+            read -s -p "> " DB_PASSWORD
+            echo
+            if [ -z "$DB_PASSWORD" ]; then
+                DB_PASSWORD=$(openssl rand -base64 20 | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+                echo -e "${YELLOW}Generated password: $DB_PASSWORD${NC}"
+                echo -e "${YELLOW}Please save this password as it won't be shown again.${NC}"
             fi
             
-            ssh root@$DROPLET_IP "mkdir -p /var/www/app"
-            scp -r $LOCAL_DIR/* root@$DROPLET_IP:/var/www/app/
+            echo -e "Enter your database name (default: appdb):"
+            read -p "> " DB_NAME
+            DB_NAME=${DB_NAME:-appdb}
+            
+            echo -e "Enter your API port (default: 8000):"
+            read -p "> " API_PORT
+            API_PORT=${API_PORT:-8000}
+            
+            echo -e "Enter your application port (default: 3000):"
+            read -p "> " APP_PORT
+            APP_PORT=${APP_PORT:-3000}
+            
+            # Export variables for template
+            export DB_USER="$DB_USER"
+            export DB_PASSWORD="$DB_PASSWORD"
+            export DB_NAME="$DB_NAME"
+            export API_KEY=${API_KEY:-default_key}
+            export ADMIN_API_KEY=${ADMIN_API_KEY:-default_admin_key}
+            export GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-username/repository}
+            export TAG=${TAG:-latest}
+            export PUBLIC_API_URL=${PUBLIC_API_URL:-http://localhost:8000}
+            export APP_PORT="$APP_PORT"
+            export API_PORT="$API_PORT"
+            
+            # Process the template
+            process_template_env "$env_template" "$temp_env_file"
+            
+            # Upload the .env file
+            scp "$temp_env_file" root@$DROPLET_IP:/var/www/app/.env
+            
+            # Clean up
+            rm "$temp_env_file"
+            
+            # Reset exported variables
+            unset DB_USER DB_PASSWORD DB_NAME API_KEY ADMIN_API_KEY GITHUB_REPOSITORY TAG PUBLIC_API_URL APP_PORT API_PORT
+            
+            # Set up process manager
+            echo -e "Setting up PM2 process manager..."
+            ssh root@$DROPLET_IP "npm install -g pm2 && cd /var/www/app && pm2 start npm --name \"app\" -- start && pm2 save && pm2 startup"
             ;;
-        2) # Manual setup
-            echo -e "Please set up your application manually."
-            echo -e "SSH into your server with: ssh root@$DROPLET_IP"
-            ;;
-    esac
-    
-    # Run application setup if needed
-    if [ $SOURCE_TYPE_INDEX -ne 2 ]; then
-        case $APP_TYPE_INDEX in
-            0) # Node.js
-                echo -e "Running npm install..."
-                ssh root@$DROPLET_IP "cd /var/www/app && npm install"
+        1) # Python
+            echo -e "Setting up Python virtual environment..."
+            ssh root@$DROPLET_IP "cd /var/www/app && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+            
+            echo -e "Do you want to set up Gunicorn? (y/n)"
+            read -p "> " USE_GUNICORN
+            
+            if [[ $USE_GUNICORN =~ ^[Yy]$ ]]; then
+                ssh root@$DROPLET_IP "cd /var/www/app && source venv/bin/activate && pip install gunicorn"
                 
-                echo -e "Do you want to set up a process manager (PM2)? (y/n)"
-                read -p "> " USE_PM2
+                echo -e "Enter the WSGI application (e.g., app:app):"
+                read -p "> " WSGI_APP
                 
-                if [[ $USE_PM2 =~ ^[Yy]$ ]]; then
-                    ssh root@$DROPLET_IP "npm install -g pm2"
-                    
-                    echo -e "Enter the start script (e.g., app.js or npm start):"
-                    read -p "> " START_SCRIPT
-                    
-                    ssh root@$DROPLET_IP "cd /var/www/app && pm2 start $START_SCRIPT --name app && pm2 save && pm2 startup"
-                fi
-                ;;
-            1) # Python
-                echo -e "Setting up Python virtual environment..."
-                ssh root@$DROPLET_IP "cd /var/www/app && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
-                
-                echo -e "Do you want to set up Gunicorn? (y/n)"
-                read -p "> " USE_GUNICORN
-                
-                if [[ $USE_GUNICORN =~ ^[Yy]$ ]]; then
-                    ssh root@$DROPLET_IP "cd /var/www/app && source venv/bin/activate && pip install gunicorn"
-                    
-                    echo -e "Enter the WSGI application (e.g., app:app):"
-                    read -p "> " WSGI_APP
-                    
-                    # Create systemd service
-                    cat > gunicorn.service <<EOF
+                # Create systemd service
+                cat > gunicorn.service <<EOF
 [Unit]
 Description=Gunicorn instance to serve application
 After=network.target
@@ -510,22 +505,22 @@ ExecStart=/var/www/app/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:8000 $WSGI_A
 [Install]
 WantedBy=multi-user.target
 EOF
-                    
-                    scp gunicorn.service root@$DROPLET_IP:/etc/systemd/system/gunicorn.service
-                    ssh root@$DROPLET_IP "systemctl enable gunicorn && systemctl start gunicorn"
-                    rm gunicorn.service
-                fi
-                ;;
-            2) # Ruby
-                echo -e "Installing Ruby dependencies..."
-                ssh root@$DROPLET_IP "cd /var/www/app && gem install bundler && bundle install"
                 
-                echo -e "Do you want to set up Puma? (y/n)"
-                read -p "> " USE_PUMA
-                
-                if [[ $USE_PUMA =~ ^[Yy]$ ]]; then
-                    # Create systemd service
-                    cat > puma.service <<EOF
+                scp gunicorn.service root@$DROPLET_IP:/etc/systemd/system/gunicorn.service
+                ssh root@$DROPLET_IP "systemctl enable gunicorn && systemctl start gunicorn"
+                rm gunicorn.service
+            fi
+            ;;
+        2) # Ruby
+            echo -e "Installing Ruby dependencies..."
+            ssh root@$DROPLET_IP "cd /var/www/app && gem install bundler && bundle install"
+            
+            echo -e "Do you want to set up Puma? (y/n)"
+            read -p "> " USE_PUMA
+            
+            if [[ $USE_PUMA =~ ^[Yy]$ ]]; then
+                # Create systemd service
+                cat > puma.service <<EOF
 [Unit]
 Description=Puma HTTP Server
 After=network.target
@@ -540,23 +535,22 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-                    
-                    scp puma.service root@$DROPLET_IP:/etc/systemd/system/puma.service
-                    ssh root@$DROPLET_IP "systemctl enable puma && systemctl start puma"
-                    rm puma.service
-                fi
-                ;;
-            3) # PHP
-                # Set up PHP-FPM
-                ssh root@$DROPLET_IP "systemctl enable php7.4-fpm && systemctl start php7.4-fpm"
-                ;;
-        esac
-    fi
+                
+                scp puma.service root@$DROPLET_IP:/etc/systemd/system/puma.service
+                ssh root@$DROPLET_IP "systemctl enable puma && systemctl start puma"
+                rm puma.service
+            fi
+            ;;
+        3) # PHP
+            # Set up PHP-FPM
+            ssh root@$DROPLET_IP "systemctl enable php7.4-fpm && systemctl start php7.4-fpm"
+            ;;
+    esac
     
     # Configure web server
     configure_web_server
     
-    echo -e "${GREEN}✓ Application deployed using traditional method${NC}"
+    echo -e "${GREEN}✓ Application deployed${NC}"
     sleep 2
 }
 
@@ -654,54 +648,47 @@ configure_web_server() {
 configure_nginx() {
     echo -e "${GREEN}Configuring Nginx...${NC}"
     
+    local template_file=""
+    local temp_config_file=$(mktemp)
+    
     # Create Nginx configuration based on deployment type
     if [ "$DEPLOYMENT_TYPE" == "docker-compose" ] || [ "$DEPLOYMENT_TYPE" == "docker" ]; then
         # Ask for container port
         echo -e "Enter the port your container exposes (e.g., 3000):"
         read -p "> " CONTAINER_PORT
+        CONTAINER_PORT=${CONTAINER_PORT:-3000}
         
-        cat > nginx.conf <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
-
-    location / {
-        proxy_pass http://localhost:$CONTAINER_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-    }
-}
-EOF
+        # Use docker template
+        template_file=$(get_template_path "nginx" "docker.conf")
+        
+        # Export variables for template
+        export DOMAIN_NAME="$DOMAIN_NAME"
+        export CONTAINER_PORT="$CONTAINER_PORT"
+        
+        # Process the template
+        process_template_env "$template_file" "$temp_config_file"
+        
     elif [ "$DEPLOYMENT_TYPE" == "traditional" ]; then
         # Configure based on application type
         case $APP_TYPE_INDEX in
             0|1|2) # Node.js, Python, Ruby (assuming they run on a port)
                 echo -e "Enter the port your application runs on (e.g., 3000):"
                 read -p "> " APP_PORT
+                APP_PORT=${APP_PORT:-3000}
                 
-                cat > nginx.conf <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
-
-    location / {
-        proxy_pass http://localhost:$APP_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-    }
-}
-EOF
+                # Use app template
+                template_file=$(get_template_path "nginx" "app.conf")
+                
+                # Export variables for template
+                export DOMAIN_NAME="$DOMAIN_NAME"
+                export APP_PORT="$APP_PORT"
+                
+                # Process the template
+                process_template_env "$template_file" "$temp_config_file"
                 ;;
             3) # PHP
-                cat > nginx.conf <<EOF
+                # Create custom PHP configuration
+                cat > "$temp_config_file" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -726,7 +713,8 @@ server {
 EOF
                 ;;
             *)
-                cat > nginx.conf <<EOF
+                # Create custom configuration for other app types
+                cat > "$temp_config_file" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -743,7 +731,8 @@ EOF
                 ;;
         esac
     elif [ "$DEPLOYMENT_TYPE" == "static" ]; then
-        cat > nginx.conf <<EOF
+        # Create custom static website configuration
+        cat > "$temp_config_file" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -761,11 +750,16 @@ EOF
     
     # Upload and enable the Nginx configuration
     ssh root@$DROPLET_IP "apt-get update && apt-get install -y nginx"
-    scp nginx.conf root@$DROPLET_IP:/etc/nginx/sites-available/$DOMAIN_NAME.conf
+    scp "$temp_config_file" root@$DROPLET_IP:/etc/nginx/sites-available/$DOMAIN_NAME.conf
     ssh root@$DROPLET_IP "ln -sf /etc/nginx/sites-available/$DOMAIN_NAME.conf /etc/nginx/sites-enabled/$DOMAIN_NAME.conf"
     ssh root@$DROPLET_IP "nginx -t && systemctl restart nginx"
     
-    rm nginx.conf
+    # Clean up local temp file
+    rm "$temp_config_file"
+    
+    # Reset exported variables
+    unset DOMAIN_NAME CONTAINER_PORT APP_PORT
+    
     echo -e "${GREEN}✓ Nginx configured${NC}"
 }
 
