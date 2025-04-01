@@ -10,6 +10,70 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 HIGHLIGHT='\033[7m' # Reverse video for highlight
 
+# Configure preferred editor
+PREFERRED_EDITOR="nano"
+EDITOR_INSTRUCTIONS="Use arrow keys to navigate, CTRL+O to save, CTRL+X to exit"
+
+# Function to safely edit files via SSH
+ssh_edit_file() {
+    local host="$1"
+    local file_path="$2"
+    local temp_file="/tmp/do_deploy_temp_$(date +%s).txt"
+    
+    # Instead of editing directly on the server, download the file, edit locally, then upload
+    echo -e "${GREEN}Downloading file for editing...${NC}"
+    scp "$host:$file_path" "$temp_file" 2>/dev/null
+    
+    if [ ! -f "$temp_file" ]; then
+        # File doesn't exist on server, create an empty one
+        touch "$temp_file"
+    fi
+    
+    # Provide clear instructions for editing
+    echo -e "${YELLOW}===========================================${NC}"
+    echo -e "${YELLOW}   FILE EDITOR - PLEASE READ CAREFULLY   ${NC}"
+    echo -e "${YELLOW}===========================================${NC}"
+    echo -e "${GREEN}1. The file will open in your default text editor.${NC}"
+    echo -e "${GREEN}2. Make your changes and save the file.${NC}"
+    echo -e "${GREEN}3. Close the editor to continue the deployment.${NC}"
+    echo -e "${YELLOW}===========================================${NC}"
+    echo -e "Press ${CYAN}Enter${NC} to open the editor..."
+    read
+    
+    # Open the file with the user's default editor or fallback to nano
+    if [ -n "$EDITOR" ]; then
+        $EDITOR "$temp_file"
+    else
+        nano "$temp_file"
+    fi
+    
+    # Ask for confirmation before uploading
+    echo -e "${GREEN}Upload the edited file to the server? (y/n)${NC}"
+    read -p "> " UPLOAD_CONFIRM
+    
+    if [[ $UPLOAD_CONFIRM =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}Uploading file to server...${NC}"
+        scp "$temp_file" "$host:$file_path"
+        echo -e "${GREEN}File uploaded successfully.${NC}"
+    else
+        echo -e "${YELLOW}Changes not uploaded. Continuing...${NC}"
+    fi
+    
+    # Clean up
+    rm -f "$temp_file"
+}
+
+# Function to safely edit local files
+edit_local_file() {
+    local file_path="$1"
+    
+    echo -e "${YELLOW}Editor tips: This will open ${PREFERRED_EDITOR}. ${EDITOR_INSTRUCTIONS}.${NC}"
+    echo -e "${YELLOW}If you see strange characters when using arrow keys, try pressing ESC first.${NC}"
+    
+    # Force the use of nano to avoid terminal issues
+    EDITOR=${PREFERRED_EDITOR} ${PREFERRED_EDITOR} "${file_path}"
+}
+
 # Print a header with a title
 show_header() {
     local title="$1"
@@ -79,6 +143,146 @@ select_from_menu() {
     done
 }
 
+# Function to select programming languages and suggest appropriate packages
+language_packages_menu() {
+    show_header "Programming Languages"
+    echo -e "${GREEN}Select the programming languages used in your project${NC}"
+    echo -e "${YELLOW}This will help suggest appropriate packages to install${NC}"
+    echo
+    
+    # Array to hold selected languages
+    SELECTED_LANGS=""
+    
+    # Define language options and their packages
+    # We'll use simple arrays instead of associative arrays for compatibility
+    LANGUAGES=("Python" "Node.js" "Ruby" "PHP" "Go" "Java")
+    
+    # Function to get packages for a language
+    get_packages_for_language() {
+        local lang="$1"
+        case "$lang" in
+            "Python")
+                echo "python3-pip python3-venv build-essential libpq-dev"
+                ;;
+            "Node.js")
+                echo "nodejs npm"
+                ;;
+            "Ruby")
+                echo "ruby-full build-essential zlib1g-dev"
+                ;;
+            "PHP")
+                echo "php php-cli php-fpm php-json php-common php-mysql php-zip php-gd php-mbstring php-curl php-xml php-pear php-bcmath"
+                ;;
+            "Go")
+                echo "golang-go"
+                ;;
+            "Java")
+                echo "default-jdk maven"
+                ;;
+            *)
+                echo ""
+                ;;
+        esac
+    }
+    
+    # Create menu options
+    LANGUAGE_OPTIONS=()
+    for lang in "${LANGUAGES[@]}"; do
+        LANGUAGE_OPTIONS+=("$lang")
+    done
+    LANGUAGE_OPTIONS+=("Done selecting")
+    
+    # Keep asking until user selects "Done"
+    while true; do
+        select_from_menu "Select a language (or Done when finished)" "${LANGUAGE_OPTIONS[@]}"
+        LANG_CHOICE=$?
+        
+        # If user selected "Done", break the loop
+        if [ "${LANGUAGE_OPTIONS[$LANG_CHOICE]}" == "Done selecting" ]; then
+            break
+        fi
+        
+        # Add selected language to string if not already selected
+        selected_lang="${LANGUAGE_OPTIONS[$LANG_CHOICE]}"
+        if [[ ! "$SELECTED_LANGS" =~ "$selected_lang" ]]; then
+            if [ -z "$SELECTED_LANGS" ]; then
+                SELECTED_LANGS="$selected_lang"
+            else
+                SELECTED_LANGS="$SELECTED_LANGS $selected_lang"
+            fi
+            echo -e "${GREEN}Added ${selected_lang} to selected languages${NC}"
+            sleep 1
+        else
+            echo -e "${YELLOW}${selected_lang} already selected${NC}"
+            sleep 1
+        fi
+    done
+    
+    # Generate package suggestions based on selected languages
+    SUGGESTED_PACKAGES="git curl wget"  # Base packages everyone needs
+    
+    for lang in $SELECTED_LANGS; do
+        lang_packages=$(get_packages_for_language "$lang")
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES $lang_packages"
+    done
+    
+    # Load existing project config if available
+    PROJECT_CONFIG="$DIR/.do_deploy.project"
+    PROJECT_NAME=${PROJECT_NAME:-"MyProject"}
+    DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE:-"docker-compose"}
+    WEBSERVER=${WEBSERVER:-"nginx"}
+    DATABASE=${DATABASE:-"postgresql"}
+    
+    if [ -f "$PROJECT_CONFIG" ]; then
+        log_verbose "Reading existing project configuration"
+        source "$PROJECT_CONFIG"
+    fi
+    
+    # Add database-specific packages if needed
+    if [ "$DATABASE" == "postgresql" ]; then
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES postgresql-client"
+    elif [ "$DATABASE" == "mysql" ]; then
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES mysql-client"
+    elif [ "$DATABASE" == "mongodb" ]; then
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES mongodb-clients"
+    fi
+    
+    # Add web server specific packages if needed
+    if [ "$WEBSERVER" == "nginx" ]; then
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES certbot python3-certbot-nginx"
+    elif [ "$WEBSERVER" == "apache" ]; then
+        SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES certbot python3-certbot-apache"
+    fi
+    
+    # Create or update the project config file
+    if [ -f "$PROJECT_CONFIG" ]; then
+        # Update existing file without using sed -i for Mac compatibility
+        grep -v 'SELECTED_LANGUAGES=' "$PROJECT_CONFIG" > "$PROJECT_CONFIG.tmp"
+        grep -v 'SUGGESTED_PACKAGES=' "$PROJECT_CONFIG.tmp" > "$PROJECT_CONFIG"
+        echo "SELECTED_LANGUAGES=\"$SELECTED_LANGS\"" >> "$PROJECT_CONFIG"
+        echo "SUGGESTED_PACKAGES=\"$SUGGESTED_PACKAGES\"" >> "$PROJECT_CONFIG"
+        rm -f "$PROJECT_CONFIG.tmp"
+    else
+        # Create new file
+        mkdir -p "$DIR"
+        cat > "$PROJECT_CONFIG" <<EOF
+PROJECT_NAME="$PROJECT_NAME"
+DEPLOYMENT_TYPE="$DEPLOYMENT_TYPE" 
+WEBSERVER="$WEBSERVER"
+DATABASE="$DATABASE"
+SELECTED_LANGUAGES="$SELECTED_LANGS"
+SUGGESTED_PACKAGES="$SUGGESTED_PACKAGES"
+EOF
+    fi
+    
+    echo -e "${GREEN}Based on your selections, we recommend installing:${NC}"
+    echo -e "${YELLOW}$SUGGESTED_PACKAGES${NC}"
+    echo
+    echo -e "You can edit this list when prompted during the droplet creation process."
+    echo
+    read -p "Press Enter to continue..."
+}
+
 # Initial setup wizard for project configuration
 initial_setup_wizard() {
     show_header "Project Setup"
@@ -140,6 +344,9 @@ initial_setup_wizard() {
         2) DATABASE="mongodb" ;;
         3) DATABASE="none" ;;
     esac
+    
+    # Get languages and suggested packages
+    language_packages_menu
     
     # Save project configuration
     cat > "$DIR/.do_deploy.project" <<EOF

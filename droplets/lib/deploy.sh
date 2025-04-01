@@ -7,9 +7,94 @@ deploy_app() {
     
     # Check if we have a droplet IP
     if [ -z "$DROPLET_IP" ]; then
-        echo -e "${RED}Error: No droplet IP found. Please create a droplet first.${NC}"
-        sleep 2
+        log_error "No droplet IP found. Please create a droplet first."
+        echo -e "${YELLOW}To create a droplet:${NC}"
+        echo -e "  1. Return to the main menu"
+        echo -e "  2. Select 'Create a new droplet'"
+        echo -e "  3. Follow the prompts to configure and create your droplet"
+        echo -e "  4. Wait for droplet initialization to complete"
+        echo -e "  5. Return to this menu option"
+        
+        read -p "Press Enter to return to the main menu..."
         return 1
+    fi
+    
+    log_verbose "Found droplet IP: $DROPLET_IP"
+    
+    # Verify SSH connection
+    log_verbose "Verifying SSH connection to $DROPLET_IP..."
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP exit &>/dev/null; then
+        log_error "Cannot connect to the droplet at $DROPLET_IP"
+        echo -e "${YELLOW}Possible issues:${NC}"
+        echo -e "  - SSH key not configured correctly"
+        echo -e "  - Droplet not fully initialized yet (try again in a minute)"
+        echo -e "  - Firewall blocking SSH connections"
+        echo -e "  - Incorrect IP address: $DROPLET_IP"
+        
+        read -p "Press Enter to return to the main menu..."
+        return 1
+    fi
+    
+    log_verbose "SSH connection verified successfully"
+    
+    # Check if app is already deployed
+    log_verbose "Checking if application is already deployed..."
+    APP_DEPLOYED=false
+    if ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP "test -d ${APP_ROOT:-/root/app} && ls -A ${APP_ROOT:-/root/app} | grep -q ." &>/dev/null; then
+        log_verbose "Detected existing deployment in ${APP_ROOT:-/root/app}"
+        APP_DEPLOYED=true
+        
+        echo -e "${YELLOW}An existing deployment was detected.${NC} What would you like to do?"
+        DEPLOY_OPTIONS=(
+            "Update existing deployment"
+            "Replace with fresh deployment"
+            "Return to main menu"
+        )
+        
+        select_from_menu "Select an option" "${DEPLOY_OPTIONS[@]}"
+        DEPLOY_CHOICE=$?
+        
+        case $DEPLOY_CHOICE in
+            0) # Update
+                log_verbose "Updating existing deployment..."
+                # Continue with deployment but skip environment setup if .env exists
+                if ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP "test -f ${APP_ROOT:-/root/app}/.env" &>/dev/null; then
+                    log_verbose "Existing .env file found, will skip environment setup unless explicitly requested"
+                    SKIP_ENV_SETUP=true
+                fi
+                ;;
+            1) # Replace
+                log_verbose "Replacing with fresh deployment..."
+                echo -e "${YELLOW}This will remove all existing deployment files. Proceed?${NC} (y/n)"
+                read -p "> " CONFIRM_REPLACE
+                
+                if [[ $CONFIRM_REPLACE =~ ^[Yy]$ ]]; then
+                    log_verbose "Removing existing deployment..."
+                    ssh root@$DROPLET_IP "rm -rf ${APP_ROOT:-/root/app}/* ${APP_ROOT:-/root/app}/.env"
+                    log_verbose "Existing deployment removed"
+                    APP_DEPLOYED=false
+                else
+                    echo -e "${YELLOW}Replacement cancelled.${NC}"
+                    return 1
+                fi
+                ;;
+            2) # Return
+                log_verbose "Returning to main menu"
+                return 0
+                ;;
+        esac
+    fi
+    
+    # Configure environment if needed
+    if [ "$SKIP_ENV_SETUP" != "true" ]; then
+        log_verbose "Setting up application environment..."
+        if ! configure_app_environment; then
+            log_error "Failed to configure application environment"
+            read -p "Press Enter to return to the main menu..."
+            return 1
+        fi
+    else
+        log_verbose "Skipping environment setup as requested"
     fi
     
     # Different deployment based on deployment type
@@ -38,52 +123,50 @@ deploy_app() {
 deploy_docker_compose() {
     echo -e "${GREEN}Deploying with Docker Compose...${NC}"
     
+    # We don't need to check DROPLET_IP here since it's already checked in deploy_app
+    log_debug "Using droplet IP: $DROPLET_IP"
+    
     # Set up remote Docker host
     export DOCKER_HOST=ssh://root@$DROPLET_IP
     
     # Check connection
+    log_verbose "Checking Docker connection..."
     if ! docker info &> /dev/null; then
-        echo -e "${RED}Cannot connect to Docker on the remote server.${NC}"
+        log_error "Cannot connect to Docker on the remote server."
+        echo -e "${YELLOW}Possible issues:${NC}"
+        echo -e "  - Docker might not be installed on the droplet"
+        echo -e "  - Docker daemon might not be running"
+        echo -e "  - SSH connection might not be configured for Docker"
         unset DOCKER_HOST
         sleep 2
         return 1
     fi
     
-    # Copy files to the droplet
-    echo -e "Copying configuration files..."
-    ssh root@$DROPLET_IP "mkdir -p /root/app"
+    log_verbose "Docker connection successful"
     
-    # Ask about docker-compose file path
-    echo -e "Enter the path to your docker-compose.yml file (relative to current directory):"
-    read -p "> " COMPOSE_FILE
+    # Ask whether to use local docker-compose or GitHub Container Registry
+    echo -e "${GREEN}How do you want to deploy?${NC}"
+    SOURCE_OPTIONS=(
+        "Use local docker-compose.yml file"
+        "Pull images from GitHub Container Registry"
+        "Return to main menu"
+    )
     
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo -e "${RED}File not found: $COMPOSE_FILE${NC}"
-        unset DOCKER_HOST
-        sleep 2
-        return 1
-    fi
+    select_from_menu "Select a deployment source" "${SOURCE_OPTIONS[@]}"
+    SOURCE_CHOICE=$?
     
-    scp "$COMPOSE_FILE" root@$DROPLET_IP:/root/app/docker-compose.yml
-    
-    # Check if .env.example exists
-    if [ -f ".env.example" ]; then
-        scp .env.example root@$DROPLET_IP:/root/app/
-        ssh root@$DROPLET_IP "cd /root/app && cp .env.example .env"
-        
-        echo -e "${GREEN}Update the .env file with production values:${NC}"
-        ssh root@$DROPLET_IP "nano /root/app/.env"
-    else
-        echo -e "${YELLOW}No .env.example file found. Creating an empty .env file...${NC}"
-        ssh root@$DROPLET_IP "touch /root/app/.env"
-        echo -e "${GREEN}Update the .env file with production values:${NC}"
-        ssh root@$DROPLET_IP "nano /root/app/.env"
-    fi
-    
-    # Deploy using docker-compose
-    echo -e "Deploying containers..."
-    docker-compose -f docker-compose.yml -H ssh://root@$DROPLET_IP build
-    docker-compose -f docker-compose.yml -H ssh://root@$DROPLET_IP up -d
+    case $SOURCE_CHOICE in
+        0) # Local docker-compose
+            deploy_docker_compose_local
+            ;;
+        1) # GitHub Container Registry
+            deploy_docker_compose_ghcr
+            ;;
+        2) # Return
+            unset DOCKER_HOST
+            return 0
+            ;;
+    esac
     
     # Configure web server if needed
     if [ "$WEBSERVER" != "none" ]; then
@@ -93,6 +176,143 @@ deploy_docker_compose() {
     unset DOCKER_HOST
     echo -e "${GREEN}✓ Application deployed with Docker Compose${NC}"
     sleep 2
+}
+
+# Deploy using local docker-compose.yml
+deploy_docker_compose_local() {
+    # Copy files to the droplet
+    echo -e "Copying configuration files..."
+    
+    # Ask about docker-compose file path
+    echo -e "Enter the path to your docker-compose.yml file (relative to current directory):"
+    read -p "> " COMPOSE_FILE
+    
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}File not found: $COMPOSE_FILE${NC}"
+        return 1
+    fi
+    
+    scp "$COMPOSE_FILE" root@$DROPLET_IP:/root/app/docker-compose.yml
+    
+    # Deploy using docker-compose
+    echo -e "Deploying containers..."
+    docker-compose -f docker-compose.yml -H ssh://root@$DROPLET_IP build
+    docker-compose -f docker-compose.yml -H ssh://root@$DROPLET_IP up -d
+}
+
+# Deploy using GitHub Container Registry
+deploy_docker_compose_ghcr() {
+    echo -e "${GREEN}Deploying from GitHub Container Registry...${NC}"
+    
+    # Collect GitHub information
+    echo -e "Enter your GitHub username:"
+    read -p "> " GITHUB_USERNAME
+    
+    echo -e "Enter your GitHub repository (e.g., username/repository):"
+    read -p "> " GITHUB_REPOSITORY
+    
+    echo -e "Enter the image tag to deploy (e.g., latest):"
+    read -p "> " TAG
+    
+    # Ask for GitHub token
+    echo -e "Enter your GitHub Personal Access Token (will not be displayed):"
+    read -s -p "> " GITHUB_TOKEN
+    echo
+    
+    # Create setup script on the droplet
+    echo -e "Setting up GitHub Container Registry authentication..."
+    
+    cat << EOF > /tmp/setup_ghcr.sh
+#!/bin/bash
+# Setup script for GitHub Container Registry authentication
+
+# Login to GitHub Container Registry
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
+
+# Pull the images
+docker pull ghcr.io/$GITHUB_REPOSITORY/backend:$TAG
+docker pull ghcr.io/$GITHUB_REPOSITORY/frontend:$TAG
+
+# Create docker-compose.yml
+cat << EOC > /root/app/docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${DB_USER:-appuser}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-changeme}
+      - POSTGRES_DB=${DB_NAME:-appdb}
+    restart: always
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DB_USER:-appuser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/$GITHUB_REPOSITORY/backend:$TAG
+    volumes:
+      - ./cache:/app/cache 
+      - ./images:/app/images
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=db
+      - DB_USER=${DB_USER:-appuser}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - DB_NAME=${DB_NAME:-appdb}
+      - API_KEY=${API_KEY:-default_key}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-default_admin_key}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  frontend:
+    image: ghcr.io/$GITHUB_REPOSITORY/frontend:$TAG
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: always
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d
+      - ./nginx/certbot/conf:/etc/letsencrypt
+      - ./nginx/certbot/www:/var/www/certbot
+    depends_on:
+      - backend
+      - frontend
+    restart: always
+
+volumes:
+  postgres_data:
+EOC
+
+EOF
+    
+    # Copy and execute the script on the droplet
+    scp /tmp/setup_ghcr.sh root@$DROPLET_IP:/tmp/setup_ghcr.sh
+    ssh root@$DROPLET_IP "chmod +x /tmp/setup_ghcr.sh && /tmp/setup_ghcr.sh"
+    
+    # Deploy using docker-compose
+    echo -e "Deploying containers..."
+    docker-compose -f /root/app/docker-compose.yml -H ssh://root@$DROPLET_IP up -d
+    
+    # Clean up
+    ssh root@$DROPLET_IP "rm /tmp/setup_ghcr.sh"
+    rm /tmp/setup_ghcr.sh
 }
 
 # Deploy using single Docker container
@@ -745,4 +965,233 @@ webserver_menu() {
                 ;;
         esac
     done
+}
+
+# Configure the application environment
+configure_app_environment() {
+    log_debug "Starting configure_app_environment function"
+    
+    # Verify DROPLET_IP is set and valid
+    if [ -z "$DROPLET_IP" ]; then
+        log_error "DROPLET_IP is empty or not set! Cannot configure environment."
+        echo -e "${YELLOW}You need to create a droplet first before configuring the environment.${NC}"
+        return 1
+    fi
+    
+    log_debug "Using DROPLET_IP: $DROPLET_IP"
+    echo "Configuring application environment..."
+    echo -e "Using SSH connection: ${GREEN}root@$DROPLET_IP${NC}"
+    
+    # Test SSH connection
+    log_verbose "Testing SSH connection..."
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP exit &>/dev/null; then
+        log_error "Cannot connect to the droplet at $DROPLET_IP"
+        echo -e "${YELLOW}Unable to establish SSH connection.${NC}"
+        return 1
+    fi
+    
+    ssh root@$DROPLET_IP "mkdir -p /root/app"
+    
+    log_verbose "Launching environment editor script..."
+    
+    # Use the correct path for the Python script
+    SCRIPT_PATH="$DIR/edit-remote-env.py"
+    log_debug "Editor script path: $SCRIPT_PATH"
+    
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        log_error "Python editor script not found at: $SCRIPT_PATH"
+        echo -e "${YELLOW}The Python editor script is missing. Creating it now...${NC}"
+        
+        # Create the basic script if it doesn't exist
+        cat > "$SCRIPT_PATH" <<'EOF'
+#!/usr/bin/env python3
+# Script to edit remote .env file
+
+import os
+import sys
+import subprocess
+import tempfile
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 edit-remote-env.py <droplet-ip>")
+        sys.exit(1)
+    
+    droplet_ip = sys.argv[1]
+    print(f"Setting up environment file for droplet at {droplet_ip}")
+    
+    # Create app directory
+    subprocess.run(f'ssh root@{droplet_ip} "mkdir -p /root/app"', shell=True, check=True)
+    
+    # Create temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.env', mode='w+') as tmp:
+        temp_file = tmp.name
+        
+        # Check if .env already exists on server
+        result = subprocess.run(
+            f'ssh root@{droplet_ip} "test -f /root/app/.env && echo YES || echo NO"',
+            shell=True, 
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        if result.stdout.strip() == "YES":
+            print("Existing .env found, downloading for editing...")
+            subprocess.run(f'scp root@{droplet_ip}:/root/app/.env {temp_file}', shell=True, check=True)
+        else:
+            # Create basic template
+            tmp.write("""# Database settings
+DB_HOST=localhost
+DB_USER=admin
+DB_PASSWORD=your_secure_password
+DB_NAME=appdb
+
+# Application settings
+APP_ENV=production
+APP_PORT=8000
+API_KEY=your_production_api_key
+ADMIN_API_KEY=your_production_admin_api_key
+""")
+    
+    # Open in editor
+    editor = os.environ.get('EDITOR', 'nano')
+    subprocess.run(f'{editor} {temp_file}', shell=True)
+    
+    # Upload file
+    print("Uploading .env file to server...")
+    subprocess.run(f'scp {temp_file} root@{droplet_ip}:/root/app/.env', shell=True, check=True)
+    
+    # Clean up
+    os.unlink(temp_file)
+    print("Environment setup complete!")
+
+if __name__ == "__main__":
+    main()
+EOF
+        
+        # Make it executable
+        chmod +x "$SCRIPT_PATH"
+    fi
+    
+    log_debug "Running: python3 \"$SCRIPT_PATH\" $DROPLET_IP"
+    python3 "$SCRIPT_PATH" $DROPLET_IP
+    
+    if [ $? -ne 0 ]; then
+        log_error "Environment editor script failed with exit code $?"
+        return 1
+    fi
+    
+    echo "Environment configured successfully."
+    return 0
+}
+
+# Call the environment configuration function instead of the old hard-coded section
+configure_app_environment
+
+# Check deployment status
+deployment_status() {
+    show_header "Deployment Status"
+    
+    # Check if we have a droplet IP
+    if [ -z "$DROPLET_IP" ]; then
+        log_error "No droplet IP found. Please create a droplet first."
+        read -p "Press Enter to return to the main menu..."
+        return 1
+    fi
+    
+    # Verify SSH connection
+    log_verbose "Verifying SSH connection to $DROPLET_IP..."
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP exit &>/dev/null; then
+        log_error "Cannot connect to the droplet at $DROPLET_IP"
+        echo -e "${YELLOW}Cannot check deployment status due to SSH connection issues.${NC}"
+        read -p "Press Enter to return to the main menu..."
+        return 1
+    fi
+    
+    echo -e "${GREEN}Checking deployment status...${NC}"
+    
+    # Check Docker status if applicable
+    if [ "$DEPLOYMENT_TYPE" = "docker-compose" ] || [ "$DEPLOYMENT_TYPE" = "docker" ]; then
+        echo -e "\n${CYAN}Docker Status:${NC}"
+        if ssh root@$DROPLET_IP "command -v docker &>/dev/null"; then
+            ssh root@$DROPLET_IP "docker --version"
+            ssh root@$DROPLET_IP "docker ps --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'"
+        else
+            echo -e "${YELLOW}Docker not installed or not in PATH${NC}"
+        fi
+    fi
+    
+    # Check for application directory
+    echo -e "\n${CYAN}Application Directory:${NC}"
+    if ssh root@$DROPLET_IP "test -d ${APP_ROOT:-/root/app}"; then
+        ssh root@$DROPLET_IP "ls -la ${APP_ROOT:-/root/app} | head -n 10"
+        
+        # Count files
+        FILE_COUNT=$(ssh root@$DROPLET_IP "find ${APP_ROOT:-/root/app} -type f | wc -l")
+        echo -e "${GREEN}Total files: ${YELLOW}$FILE_COUNT${NC}"
+        
+        # Check .env file
+        if ssh root@$DROPLET_IP "test -f ${APP_ROOT:-/root/app}/.env"; then
+            ENV_COUNT=$(ssh root@$DROPLET_IP "grep -v '^#' ${APP_ROOT:-/root/app}/.env | grep '=' | wc -l")
+            echo -e "${GREEN}.env file: ${YELLOW}Present with $ENV_COUNT settings${NC}"
+        else
+            echo -e "${YELLOW}.env file: Not found${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Application directory not found${NC}"
+    fi
+    
+    # Check web server
+    echo -e "\n${CYAN}Web Server Status:${NC}"
+    if [ "$WEBSERVER" = "nginx" ]; then
+        if ssh root@$DROPLET_IP "command -v nginx &>/dev/null"; then
+            ssh root@$DROPLET_IP "nginx -v 2>&1"
+            echo
+            ssh root@$DROPLET_IP "systemctl status nginx | head -n 3"
+        else
+            echo -e "${YELLOW}Nginx not installed${NC}"
+        fi
+    elif [ "$WEBSERVER" = "apache" ]; then
+        if ssh root@$DROPLET_IP "command -v apache2 &>/dev/null"; then
+            ssh root@$DROPLET_IP "apache2 -v | head -n 1"
+            echo
+            ssh root@$DROPLET_IP "systemctl status apache2 | head -n 3"
+        else
+            echo -e "${YELLOW}Apache not installed${NC}"
+        fi
+    fi
+    
+    # Check connectivity
+    echo -e "\n${CYAN}Connectivity:${NC}"
+    if ssh root@$DROPLET_IP "command -v curl &>/dev/null"; then
+        echo -e "${GREEN}Checking HTTP on localhost...${NC}"
+        ssh root@$DROPLET_IP "curl -s --connect-timeout 3 http://localhost:${APP_PORT:-3000}/ -o /dev/null -w 'Status: %{http_code}' || echo 'Failed to connect'"
+    fi
+    
+    # Check domains if configured
+    if [ ! -z "$DOMAIN_NAME" ]; then
+        echo -e "\n${CYAN}Domain Status:${NC}"
+        echo -e "${GREEN}Domain: ${YELLOW}$DOMAIN_NAME${NC}"
+        
+        # Dig if available
+        if ssh root@$DROPLET_IP "command -v dig &>/dev/null"; then
+            ssh root@$DROPLET_IP "dig +short $DOMAIN_NAME || echo 'No DNS record'"
+        else
+            # Fallback to host
+            ssh root@$DROPLET_IP "host $DOMAIN_NAME || echo 'No DNS record'"
+        fi
+        
+        # Check SSL
+        if ssh root@$DROPLET_IP "test -d /etc/letsencrypt/live/$DOMAIN_NAME"; then
+            echo -e "${GREEN}SSL Certificate: ${YELLOW}Installed${NC}"
+            CERT_EXPIRY=$(ssh root@$DROPLET_IP "openssl x509 -enddate -noout -in /etc/letsencrypt/live/$DOMAIN_NAME/cert.pem" 2>/dev/null || echo "Error reading certificate")
+            echo -e "${GREEN}Certificate expiry: ${YELLOW}$CERT_EXPIRY${NC}"
+        else
+            echo -e "${YELLOW}SSL Certificate: Not installed${NC}"
+        fi
+    fi
+    
+    echo -e "\n${GREEN}Status check complete.${NC}"
+    read -p "Press Enter to continue..."
 }

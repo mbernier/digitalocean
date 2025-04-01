@@ -154,6 +154,14 @@ REGION="$REGION"
 SIZE="$SIZE"
 IMAGE="$IMAGE"
 CREATED_AT="$(date +"%Y-%m-%d %H:%M:%S")"
+
+# Deployment configuration
+DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE:-docker-compose}"
+WEBSERVER="${WEBSERVER:-nginx}"
+DATABASE="${DATABASE:-postgresql}"
+APP_PORT="${APP_PORT:-3000}"
+API_PORT="${API_PORT:-8000}"
+APP_ROOT="${APP_ROOT:-/root/app}"
 EOF
     
     # Save variables for current session
@@ -161,4 +169,337 @@ EOF
     
     echo -e "${GREEN}✓ Droplet created and configuration saved${NC}"
     sleep 2
+}
+
+# Function to manage existing droplets
+manage_droplet() {
+    show_header "Manage Droplet"
+    
+    # Verify droplet information
+    if [ -z "$DROPLET_IP" ]; then
+        log_error "No droplet IP found in configuration."
+        echo -e "${YELLOW}Please create a droplet first.${NC}"
+        sleep 2
+        return 1
+    fi
+    
+    # Check if droplet is actually reachable
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 root@$DROPLET_IP "exit" &>/dev/null; then
+        log_error "Cannot connect to droplet at $DROPLET_IP"
+        echo -e "${RED}The droplet at $DROPLET_IP is not reachable.${NC}"
+        echo -e "${YELLOW}Possible issues:${NC}"
+        echo -e "  - The droplet has been deleted"
+        echo -e "  - The IP address has changed"
+        echo -e "  - SSH key issues"
+        echo -e "  - Network or firewall issues"
+        echo
+        echo -e "${YELLOW}Would you like to update the configuration or remove it? (u/r/n)${NC}"
+        read -p "> " UPDATE_CONFIG
+        
+        case $UPDATE_CONFIG in
+            [Uu]*)
+                echo -e "${GREEN}Enter the new IP address:${NC}"
+                read -p "> " NEW_IP
+                
+                if [[ $NEW_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    DROPLET_IP=$NEW_IP
+                    
+                    # Update the config file
+                    sed -i.bak "s/DROPLET_IP=.*/DROPLET_IP=\"$DROPLET_IP\"/" "$DIR/.do_deploy.conf"
+                    echo -e "${GREEN}Configuration updated with new IP: $DROPLET_IP${NC}"
+                    sleep 2
+                    return 0
+                else
+                    echo -e "${RED}Invalid IP address format. No changes made.${NC}"
+                    sleep 2
+                    return 1
+                fi
+                ;;
+            [Rr]*)
+                # Remove the config file
+                rm -f "$DIR/.do_deploy.conf"
+                echo -e "${GREEN}Configuration removed. You can create a new droplet now.${NC}"
+                DROPLET_IP=""
+                DROPLET_NAME=""
+                sleep 2
+                return 0
+                ;;
+            *)
+                echo -e "${YELLOW}No changes made.${NC}"
+                sleep 2
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Check Docker status if this is a Docker deployment
+    DOCKER_STATUS=""
+    if [[ "$DEPLOYMENT_TYPE" == "docker"* ]]; then
+        if ssh -q -o BatchMode=yes root@$DROPLET_IP "command -v docker" &>/dev/null; then
+            DOCKER_STATUS="Installed"
+            
+            # Check if Docker is running
+            if ssh -q -o BatchMode=yes root@$DROPLET_IP "systemctl is-active docker" &>/dev/null; then
+                DOCKER_STATUS="Running"
+                
+                # Check for Docker Compose if this is a docker-compose deployment
+                if [[ "$DEPLOYMENT_TYPE" == "docker-compose" ]]; then
+                    if ssh -q -o BatchMode=yes root@$DROPLET_IP "command -v docker-compose" &>/dev/null || ssh -q -o BatchMode=yes root@$DROPLET_IP "docker compose version" &>/dev/null; then
+                        DOCKER_STATUS="Docker & Compose Running"
+                    else
+                        DOCKER_STATUS="Docker Running (Compose Not Found)"
+                    fi
+                fi
+            else
+                DOCKER_STATUS="Installed (Not Running)"
+            fi
+        else
+            DOCKER_STATUS="Not Installed"
+        fi
+    fi
+    
+    # Check for app directory
+    APP_DIR_STATUS=""
+    if ssh -q -o BatchMode=yes root@$DROPLET_IP "test -d ${APP_ROOT:-/root/app}" &>/dev/null; then
+        APP_FILES_COUNT=$(ssh -q -o BatchMode=yes root@$DROPLET_IP "find ${APP_ROOT:-/root/app} -type f | wc -l")
+        if [ "$APP_FILES_COUNT" -gt 0 ]; then
+            APP_DIR_STATUS="Exists with $APP_FILES_COUNT files"
+        else
+            APP_DIR_STATUS="Empty"
+        fi
+    else
+        APP_DIR_STATUS="Not Found"
+    fi
+    
+    # Display droplet info
+    echo -e "${GREEN}Droplet Information:${NC}"
+    echo -e "  Name:     ${YELLOW}$DROPLET_NAME${NC}"
+    echo -e "  IP:       ${YELLOW}$DROPLET_IP${NC}"
+    echo -e "  Region:   ${YELLOW}$REGION${NC}"
+    echo -e "  Size:     ${YELLOW}$SIZE${NC}"
+    echo -e "  Created:  ${YELLOW}$CREATED_AT${NC}"
+    
+    if [ ! -z "$DEPLOYMENT_TYPE" ]; then
+        echo -e "  Deploy:   ${YELLOW}$DEPLOYMENT_TYPE${NC}"
+    fi
+    
+    if [ ! -z "$DOCKER_STATUS" ]; then
+        echo -e "  Docker:   ${YELLOW}$DOCKER_STATUS${NC}"
+    fi
+    
+    if [ ! -z "$APP_DIR_STATUS" ]; then
+        echo -e "  App Dir:  ${YELLOW}$APP_DIR_STATUS${NC}"
+    fi
+    
+    echo
+    
+    # Menu options
+    DROPLET_MENU_OPTIONS=(
+        "SSH into droplet"
+        "Check server status"
+        "Restart services"
+        "Power cycle droplet"
+        "Remove droplet from config"
+        "Delete droplet"
+        "Back to main menu"
+    )
+    
+    select_from_menu "Select an action" "${DROPLET_MENU_OPTIONS[@]}"
+    DROPLET_CHOICE=$?
+    
+    case $DROPLET_CHOICE in
+        0) # SSH
+            clear
+            echo -e "${GREEN}Connecting to $DROPLET_NAME ($DROPLET_IP)...${NC}"
+            echo -e "${YELLOW}Type 'exit' to return to this menu when done.${NC}"
+            echo
+            
+            ssh root@$DROPLET_IP
+            ;;
+        1) # Status
+            clear
+            echo -e "${GREEN}Checking server status...${NC}"
+            echo
+            
+            # Memory and CPU
+            echo -e "${CYAN}Memory and CPU:${NC}"
+            ssh root@$DROPLET_IP "free -h && echo && top -bn1 | head -n 5"
+            echo
+            
+            # Disk
+            echo -e "${CYAN}Disk Usage:${NC}"
+            ssh root@$DROPLET_IP "df -h"
+            echo
+            
+            # Service status - check based on deployment type
+            echo -e "${CYAN}Service Status:${NC}"
+            if [[ "$DEPLOYMENT_TYPE" == "docker"* ]]; then
+                ssh root@$DROPLET_IP "systemctl status docker --no-pager | head -n 3"
+                echo
+                ssh root@$DROPLET_IP "docker ps -a"
+            elif [ "$WEBSERVER" == "nginx" ]; then
+                ssh root@$DROPLET_IP "systemctl status nginx --no-pager | head -n 3"
+            elif [ "$WEBSERVER" == "apache" ]; then
+                ssh root@$DROPLET_IP "systemctl status apache2 --no-pager | head -n 3"
+            fi
+            
+            echo
+            read -p "Press Enter to continue..."
+            ;;
+        2) # Restart services
+            clear
+            echo -e "${GREEN}Select service to restart:${NC}"
+            
+            SERVICE_OPTIONS=()
+            
+            # Add docker if it's a docker deployment
+            if [[ "$DEPLOYMENT_TYPE" == "docker"* ]]; then
+                SERVICE_OPTIONS+=("Docker")
+                if [[ "$DEPLOYMENT_TYPE" == "docker-compose" ]]; then
+                    SERVICE_OPTIONS+=("Docker Compose")
+                fi
+            fi
+            
+            # Add web server if configured
+            if [ "$WEBSERVER" == "nginx" ]; then
+                SERVICE_OPTIONS+=("Nginx")
+            elif [ "$WEBSERVER" == "apache" ]; then
+                SERVICE_OPTIONS+=("Apache")
+            fi
+            
+            # Add database if configured
+            if [ "$DATABASE" == "postgresql" ]; then
+                SERVICE_OPTIONS+=("PostgreSQL")
+            elif [ "$DATABASE" == "mysql" ]; then
+                SERVICE_OPTIONS+=("MySQL")
+            elif [ "$DATABASE" == "mongodb" ]; then
+                SERVICE_OPTIONS+=("MongoDB")
+            fi
+            
+            SERVICE_OPTIONS+=("Cancel")
+            
+            select_from_menu "Select service to restart" "${SERVICE_OPTIONS[@]}"
+            SERVICE_CHOICE=$?
+            
+            if [ $SERVICE_CHOICE -lt $(( ${#SERVICE_OPTIONS[@]} - 1 )) ]; then
+                SERVICE=${SERVICE_OPTIONS[$SERVICE_CHOICE]}
+                
+                echo -e "${YELLOW}Restarting $SERVICE...${NC}"
+                
+                case $SERVICE in
+                    "Docker")
+                        ssh root@$DROPLET_IP "systemctl restart docker"
+                        ;;
+                    "Docker Compose")
+                        ssh root@$DROPLET_IP "cd ${APP_ROOT:-/root/app} && docker-compose down && docker-compose up -d"
+                        ;;
+                    "Nginx")
+                        ssh root@$DROPLET_IP "systemctl restart nginx"
+                        ;;
+                    "Apache")
+                        ssh root@$DROPLET_IP "systemctl restart apache2"
+                        ;;
+                    "PostgreSQL")
+                        ssh root@$DROPLET_IP "systemctl restart postgresql"
+                        ;;
+                    "MySQL")
+                        ssh root@$DROPLET_IP "systemctl restart mysql"
+                        ;;
+                    "MongoDB")
+                        ssh root@$DROPLET_IP "systemctl restart mongod"
+                        ;;
+                esac
+                
+                echo -e "${GREEN}$SERVICE restarted.${NC}"
+                sleep 2
+            fi
+            ;;
+        3) # Power cycle
+            clear
+            echo -e "${YELLOW}Power options for $DROPLET_NAME ($DROPLET_IP):${NC}"
+            
+            POWER_OPTIONS=(
+                "Reboot droplet"
+                "Power Off droplet"
+                "Power On droplet"
+                "Cancel"
+            )
+            
+            select_from_menu "Select an action" "${POWER_OPTIONS[@]}"
+            POWER_CHOICE=$?
+            
+            case $POWER_CHOICE in
+                0) # Reboot
+                    echo -e "${YELLOW}Rebooting droplet...${NC}"
+                    doctl compute droplet-action reboot $DROPLET_NAME --wait
+                    echo -e "${GREEN}Droplet rebooted.${NC}"
+                    sleep 2
+                    ;;
+                1) # Power Off
+                    echo -e "${YELLOW}Powering off droplet...${NC}"
+                    doctl compute droplet-action power-off $DROPLET_NAME --wait
+                    echo -e "${GREEN}Droplet powered off.${NC}"
+                    sleep 2
+                    ;;
+                2) # Power On
+                    echo -e "${YELLOW}Powering on droplet...${NC}"
+                    doctl compute droplet-action power-on $DROPLET_NAME --wait
+                    echo -e "${GREEN}Droplet powered on.${NC}"
+                    sleep 2
+                    ;;
+                3) # Cancel
+                    ;;
+            esac
+            ;;
+        4) # Remove from config
+            clear
+            echo -e "${YELLOW}Remove droplet from configuration?${NC}"
+            echo -e "This will only remove the local reference to the droplet."
+            echo -e "The droplet itself will continue running on DigitalOcean."
+            echo -e "${RED}Are you sure? (y/n)${NC}"
+            read -p "> " CONFIRM_REMOVE
+            
+            if [[ $CONFIRM_REMOVE =~ ^[Yy]$ ]]; then
+                rm -f "$DIR/.do_deploy.conf"
+                echo -e "${GREEN}Configuration removed.${NC}"
+                DROPLET_IP=""
+                DROPLET_NAME=""
+                sleep 2
+                return 0
+            fi
+            ;;
+        5) # Delete droplet
+            clear
+            echo -e "${RED}!!! WARNING !!!${NC}"
+            echo -e "${RED}You are about to delete droplet $DROPLET_NAME ($DROPLET_IP)${NC}"
+            echo -e "${RED}This will destroy all data on the droplet and cannot be undone.${NC}"
+            echo -e "${RED}Are you ABSOLUTELY sure? (yes/no)${NC}"
+            read -p "> " CONFIRM_DELETE
+            
+            if [ "$CONFIRM_DELETE" == "yes" ]; then
+                echo -e "${YELLOW}Deleting droplet...${NC}"
+                doctl compute droplet delete $DROPLET_NAME --force
+                
+                if [ $? -eq 0 ]; then
+                    rm -f "$DIR/.do_deploy.conf"
+                    echo -e "${GREEN}Droplet deleted and configuration removed.${NC}"
+                    DROPLET_IP=""
+                    DROPLET_NAME=""
+                else
+                    echo -e "${RED}Error deleting droplet. Please check manually.${NC}"
+                fi
+                sleep 2
+                return 0
+            else
+                echo -e "${GREEN}Deletion cancelled.${NC}"
+                sleep 2
+            fi
+            ;;
+        6) # Back
+            return 0
+            ;;
+    esac
+    
+    # Return to the manage_droplet menu after action completes
+    manage_droplet
 }

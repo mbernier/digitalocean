@@ -1,0 +1,7 @@
+# Example project configuration - customize as needed
+PROJECT_NAME="Example Project"
+DEPLOYMENT_TYPE="docker-compose"
+WEBSERVER="nginx"
+DATABASE="postgresql"
+SELECTED_LANGUAGES="Python Node.js"
+SUGGESTED_PACKAGES="git curl wget python3-pip python3-venv build-essential libpq-dev nodejs npm postgresql-client certbot python3-certbot-nginx"
